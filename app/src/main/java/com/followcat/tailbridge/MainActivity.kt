@@ -96,6 +96,9 @@ class MainActivity : ComponentActivity() {
         val logs by Bridge.log.collectAsState()
         val adbdPortF by Bridge.adbdPortFlow.collectAsState()
         val adbdAlive by Bridge.adbdAlive.collectAsState()
+        val adbdSource by Bridge.adbdPortSource.collectAsState()
+        val adbdProbing by Bridge.adbdProbing.collectAsState()
+        val manualPort by Bridge.manualPort.collectAsState()
         var host by remember { mutableStateOf(Bridge.host(this)) }
         var parkPort by remember { mutableStateOf(Bridge.parkPort(this).toString()) }
         val adbdPort = (adbdPortF.takeIf { it > 0 } ?: Bridge.adbdPort(this)).toString()
@@ -121,8 +124,14 @@ class MainActivity : ComponentActivity() {
             ) {
                 Header(st, alive)
                 StatusCard(st, alive)
-                ControlCard(st, host, parkPort, adbdPort,
+                ControlCard(st, host, parkPort, adbdPort, manualPort,
                     onHost = { host = it }, onPark = { parkPort = it },
+                    onManual = {
+                        Bridge.prefs(this@MainActivity).edit()
+                            .putBoolean(Bridge.K_MANUAL, it).apply()
+                        Bridge.manualPort.value = it
+                        if (it) Bridge.adbdPortSource.value = "manual"
+                    },
                     onSave = {
                         Bridge.prefs(this@MainActivity).edit()
                             .putString(Bridge.K_HOST, host)
@@ -134,7 +143,7 @@ class MainActivity : ComponentActivity() {
                         if (st != BridgeState.STOPPED) BridgeService.stop(this@MainActivity)
                         else BridgeService.start(this@MainActivity)
                     })
-                NetCard(adbdPort, adbdAlive)
+                NetCard(adbdPort, adbdAlive, adbdSource, adbdProbing)
                 PrefCard(auto, onAuto = {
                     auto = it
                     Bridge.prefs(this@MainActivity).edit().putBoolean(Bridge.K_AUTO, it).apply()
@@ -262,7 +271,9 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun ControlCard(
         st: BridgeState, host: String, parkPort: String, adbdPort: String,
+        manual: Boolean,
         onHost: (String) -> Unit, onPark: (String) -> Unit,
+        onManual: (Boolean) -> Unit,
         onSave: () -> Unit, onToggle: () -> Unit
     ) {
         val running = st != BridgeState.STOPPED
@@ -275,9 +286,26 @@ class MainActivity : ComponentActivity() {
                     Field("fvps 地址", host, Modifier.weight(1.4f), onChange = onHost)
                     Field("停驻口", parkPort, Modifier.weight(1f), num = true, onChange = onPark)
                 }
-                Field("本机 adbd 端口（mDNS 自动跟踪）", adbdPort,
-                    Modifier.fillMaxWidth(), num = true) {}
-                Text("停驻口 = 手机外拨到 fvps 的口；桌面 adb connect 用 2223",
+                Field(
+                    if (manual) "本机 adbd 端口（手动锁定 · 点锁恢复自动）"
+                              else "本机 adbd 端口（自动侦查 · 手填即锁定）",
+                    adbdPort, Modifier.fillMaxWidth(), num = true,
+                    onChange = { if (!manual) onManual(true) },
+                    trailing = {
+                        IconButton(onClick = { onManual(!manual) }) {
+                            Icon(
+                                if (manual) Icons.Filled.Lock else Icons.Filled.Refresh,
+                                if (manual) "手动锁定中" else "自动侦查中",
+                                tint = if (manual) Warn else Dim,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    })
+                Text(
+                    if (manual)
+                        "手动锁定: 端口固定为你填的值(配对转发/tcpip 5555 用); 点右侧锁回自动侦查"
+                    else
+                        "端口自动侦查: WiFi 下走 mDNS, 无 WiFi 时扫 loopback(TLS+CNXN); 手填端口会锁定; 停驻口 = 手机外拨到 fvps, 桌面 adb connect 用 2223",
                     color = Dim, fontSize = 11.sp, lineHeight = 15.sp)
 
                 val btnBg = if (running)
@@ -319,7 +347,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun Field(
         label: String, value: String, mod: Modifier,
-        num: Boolean = false, onChange: (String) -> Unit
+        num: Boolean = false, onChange: (String) -> Unit,
+        trailing: (@Composable () -> Unit)? = null
     ) {
         var v by remember { mutableStateOf(value) }
         LaunchedEffect(value) { v = value }
@@ -343,6 +372,7 @@ class MainActivity : ComponentActivity() {
             },
             label = { Text(label, fontSize = 11.sp) },
             singleLine = true,
+            trailingIcon = trailing,
             keyboardOptions = if (num) KeyboardOptions(keyboardType = KeyboardType.Number)
                               else KeyboardOptions.Default,
             textStyle = LocalTextStyle.current.copy(
@@ -361,7 +391,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun NetCard(adbdPort: String, adbdAlive: Boolean?) {
+    fun NetCard(adbdPort: String, adbdAlive: Boolean?, adbdSource: String, adbdProbing: Boolean) {
         val ctx = LocalContext.current
         val clip = LocalClipboardManager.current
         val haptic = LocalHapticFeedback.current
@@ -385,7 +415,7 @@ class MainActivity : ComponentActivity() {
                 NetRow(Icons.Filled.Home, "WLAN IPv4", v4, Accent)
                 NetRow(Icons.Filled.Home, "WLAN IPv6",
                     v6.take(22) + if (v6.length > 22) "…" else "", Accent)
-                NetRow(Icons.Filled.Lock, "Tailnet 节点", "100.92.116.11 (phone-flclash)", Accent)
+                NetRow(Icons.Filled.Lock, "Tailnet 节点", "100.113.116.78 (x8u)", Accent)
                 // 桌面入口：点击复制
                 Row(
                     Modifier
@@ -423,6 +453,33 @@ class MainActivity : ComponentActivity() {
                         "127.0.0.1:$adbdPort",
                         fontFamily = Mono, fontSize = 12.5.sp, color = Accent
                     )
+                    if (adbdProbing) {
+                        Spacer(Modifier.width(8.dp))
+                        Box(
+                            Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Accent.copy(alpha = 0.15f))
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text("侦查中", fontSize = 10.sp, color = Accent,
+                                fontWeight = FontWeight.Medium)
+                        }
+                    } else {
+                        val src = when (adbdSource) {
+                            "mDNS" -> "mDNS"; "probe" -> "探测"
+                            "manual" -> "手动"; else -> "缓存"
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Box(
+                            Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Accent.copy(alpha = 0.12f))
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text(src, fontSize = 10.sp, color = Accent.copy(alpha = 0.85f),
+                                fontWeight = FontWeight.Medium)
+                        }
+                    }
                     if (adbdAlive != null) {
                         Spacer(Modifier.width(8.dp))
                         Box(
