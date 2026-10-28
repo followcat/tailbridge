@@ -12,6 +12,7 @@ object Bridge {
     const val K_PARK = "park_port"
     const val K_ADBD = "adbd_port"
     const val K_AUTO = "autostart"
+    const val K_MANUAL = "manual_port"
 
     var proc: Process? = null
     @Volatile var wantRunning = false
@@ -21,6 +22,11 @@ object Bridge {
     val childAlive = MutableStateFlow(false)
     val adbdAlive = MutableStateFlow<Boolean?>(null)
     val adbdPortFlow = MutableStateFlow(0)
+    // How the current adbd port was learned: mDNS, loopback probe, stored.
+    val adbdPortSource = MutableStateFlow("stored")
+    val adbdProbing = MutableStateFlow(false)
+    // User-typed port wins: while locked, mDNS/probe must not overwrite it.
+    val manualPort = MutableStateFlow(false)
 
     fun prefs(c: Context): SharedPreferences =
         c.getSharedPreferences(PREF, Context.MODE_PRIVATE)
@@ -33,6 +39,11 @@ object Bridge {
         return p
     }
     fun autostart(c: Context) = prefs(c).getBoolean(K_AUTO, true)
+    fun manualPort(c: Context): Boolean {
+        val m = prefs(c).getBoolean(K_MANUAL, false)
+        if (manualPort.value != m) manualPort.value = m
+        return m
+    }
 
     fun pushLog(line: String) {
         val t = line.trim()

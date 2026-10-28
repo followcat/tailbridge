@@ -144,19 +144,7 @@ class BridgeService : Service() {
                         override fun onServiceResolved(i: NsdServiceInfo) {
                             val host = i.host?.hostAddress?.substringBefore('%') ?: return
                             if (host !in ownAddrs()) return   // only self's adbd
-                            val p = i.port
-                            if (p <= 0) return
-                            val cur = Bridge.adbdPort(this@BridgeService)
-                            if (p != cur) {
-                                Bridge.pushLog("mDNS: adbd port $cur -> $p")
-                                Bridge.prefs(this@BridgeService).edit()
-                                    .putInt(Bridge.K_ADBD, p).apply()
-                                Bridge.adbdPortFlow.value = p
-                                if (Bridge.wantRunning) {
-                                    Bridge.pushLog("port changed, respawning")
-                                    try { Bridge.proc?.destroy() } catch (_: Exception) {}
-                                }
-                            }
+                            applyAdbdPort(i.port, "mDNS")
                         }
                     })
                 } catch (_: Exception) {}
@@ -185,6 +173,24 @@ class BridgeService : Service() {
         mcastLock = null
     }
 
+    // A newly learned adbd port wins over the stored one: persist it,
+    // refresh the UI flow, and respawn the stitch on the new endpoint.
+    // Manual lock (typed port) beats all discovery -- e.g. pairing port
+    // relay, or the stable 5555 tcpip listener.
+    private fun applyAdbdPort(port: Int, source: String) {
+        if (port <= 0 || Bridge.manualPort(this)) return
+        val cur = Bridge.adbdPort(this)
+        Bridge.adbdPortSource.value = source
+        if (port == cur) return
+        Bridge.pushLog("$source: adbd port $cur -> $port")
+        Bridge.prefs(this).edit().putInt(Bridge.K_ADBD, port).apply()
+        Bridge.adbdPortFlow.value = port
+        if (Bridge.wantRunning) {
+            Bridge.pushLog("port changed, respawning")
+            try { Bridge.proc?.destroy() } catch (_: Exception) {}
+        }
+    }
+
     private fun startWatchdog() {
         if (watchdog?.isActive == true) return
         watchdog = scope.launch {
@@ -197,6 +203,28 @@ class BridgeService : Service() {
                         true
                     } catch (_: Exception) { false }
                     delay(8000)
+                }
+            }
+            // Port auto-discovery without WiFi: mDNS is blind off-LAN, so
+            // when the stored port is dead, scan loopback for the TLS
+            // listener (adbd binds 0.0.0.0; same trick LADB uses). A live
+            // stored port skips the scan entirely -- one handshake/cycle.
+            launch {
+                while (isActive) {
+                    delay(12000)
+                    if (Bridge.adbdAlive.value == true) continue
+                    if (Bridge.manualPort(this@BridgeService)) continue
+                    if (Bridge.adbdProbing.value) continue
+                    Bridge.adbdProbing.value = true
+                    try {
+                        val found = AdbdProbe.find(Bridge.adbdPort(this@BridgeService))
+                        if (found != null) applyAdbdPort(found, "probe")
+                        else Bridge.pushLog("probe: no adbd tls port on loopback")
+                    } catch (e: Exception) {
+                        Bridge.pushLog("probe fail: ${e.message}")
+                    } finally {
+                        Bridge.adbdProbing.value = false
+                    }
                 }
             }
             // reader: stream child output into the log/state
