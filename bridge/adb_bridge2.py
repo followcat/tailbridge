@@ -8,6 +8,13 @@ on PARK_PORT. Desktop `adb connect <fvps>:ADB_PORT` splices onto it; phone side
 v2 fix: park() kept its StreamReader.read() pending after handoff, so the
 splice pump's read() raised "already waiting" RuntimeError. Now the splice
 cancels the park task and awaits it before pumping.
+
+v3 fix: a splice only ended when a socket closed, so an adb server holding a
+dead connection (failed handshake, device marked "offline", socket left open)
+kept the single park slot forever and every later `adb connect` got refused
+with "no phone parked". A watchdog now closes a splice after SPLICE_IDLE_S
+without any phone->desktop byte (handshake should complete fast) and after
+SPLICE_ESTABLISHED_S of silence once traffic has flowed.
 """
 import asyncio
 import time
@@ -15,6 +22,8 @@ import time
 TS_IP = "100.126.239.27"
 PARK_PORT = 2222
 ADB_PORT = 2223
+SPLICE_IDLE_S = 30
+SPLICE_ESTABLISHED_S = 600
 
 parked = None  # [reader, writer, bytearray, task]
 
@@ -70,12 +79,17 @@ async def adb(reader, writer):
         writer.write(bytes(before))
         await writer.drain()
 
-    async def pump(r, w, tag):
+    state = {"last": time.monotonic(), "up": False}
+
+    async def pump(r, w, tag, phone_side=False):
         try:
             while True:
                 data = await r.read(65536)
                 if not data:
                     break
+                state["last"] = time.monotonic()
+                if phone_side:
+                    state["up"] = True
                 log(tag, len(data), "B")
                 w.write(data)
                 await w.drain()
@@ -87,7 +101,28 @@ async def adb(reader, writer):
             except Exception:
                 pass
 
-    await asyncio.gather(pump(reader, pw, "pc->ph"), pump(pr, writer, "ph->pc"))
+    async def watchdog():
+        while True:
+            await asyncio.sleep(5)
+            idle = time.monotonic() - state["last"]
+            if idle > (SPLICE_ESTABLISHED_S if state["up"] else SPLICE_IDLE_S):
+                log(f"splice idle {idle:.0f}s for", peer, "- closing")
+                for w in (writer, pw):
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+                return
+
+    tasks = [
+        asyncio.create_task(pump(reader, pw, "pc->ph")),
+        asyncio.create_task(pump(pr, writer, "ph->pc", phone_side=True)),
+        asyncio.create_task(watchdog()),
+    ]
+    _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     log("splice done for", peer)
 
 
