@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""adb-over-tailnet bridge, v2.
+"""adb-over-tailnet bridge, v4.
 
 Phone (behind FlClash/mihomo tsnet, outbound-only) dials out and parks a conn
 on PARK_PORT. Desktop `adb connect <fvps>:ADB_PORT` splices onto it; phone side
@@ -15,8 +15,18 @@ kept the single park slot forever and every later `adb connect` got refused
 with "no phone parked". A watchdog now closes a splice after SPLICE_IDLE_S
 without any phone->desktop byte (handshake should complete fast) and after
 SPLICE_ESTABLISHED_S of silence once traffic has flowed.
+
+v4 fix: adb servers retry dead transports in a fast loop (~100 conn/s seen).
+Each retry used to consume a fresh park instantly, die mid-handshake, and kill
+the park with it -- the phone's re-park then met the next stale retry, forever.
+Now an adb conn must produce a valid `CNXN` header within ADB_HANDSHAKE_S
+*before* it may consume a park; stale retries die alone and the park survives.
+Also: an adb conn arriving with no park waits PARK_WAIT_S for one instead of
+being refused instantly (cuts the reconnect storm), and park sockets get TCP
+keepalive so a silently-dead park vacates the slot within ~105s.
 """
 import asyncio
+import socket
 import time
 
 TS_IP = "100.126.239.27"
@@ -24,12 +34,29 @@ PARK_PORT = 2222
 ADB_PORT = 2223
 SPLICE_IDLE_S = 30
 SPLICE_ESTABLISHED_S = 600
+ADB_HANDSHAKE_S = 3   # adb conn must send CNXN within this or die alone
+PARK_WAIT_S = 3       # adb conn with no phone waits this long for a park
 
-parked = None  # [reader, writer, bytearray, task]
+parked = None   # [reader, writer, bytearray, task]
+park_ev = asyncio.Event()
+_last_nopark_log = 0.0
 
 
 def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+
+def keepalive(writer):
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass
 
 
 async def park(reader, writer):
@@ -41,8 +68,10 @@ async def park(reader, writer):
             parked[1].close()
         except Exception:
             pass
+    keepalive(writer)
     slot = [reader, writer, bytearray(), asyncio.current_task()]
     parked = slot
+    park_ev.set()
     log("parked phone conn from", peer)
     try:
         while True:
@@ -60,14 +89,36 @@ async def park(reader, writer):
 
 
 async def adb(reader, writer):
-    global parked
+    global parked, _last_nopark_log
     peer = writer.get_extra_info("peername")
     if not parked:
-        log("adb conn from", peer, "- no phone parked, closing")
+        try:
+            await asyncio.wait_for(park_ev.wait(), PARK_WAIT_S)
+        except asyncio.TimeoutError:
+            pass
+    if not parked:
+        now = time.monotonic()
+        if now - _last_nopark_log > 5:
+            _last_nopark_log = now
+            log("adb conn from", peer, "- no phone parked, closing")
+        writer.close()
+        return
+    # CNXN gate: prove this is a live adb client before it may take the park.
+    try:
+        head = await asyncio.wait_for(reader.read(64), ADB_HANDSHAKE_S)
+    except (asyncio.TimeoutError, Exception):
+        head = b""
+    if not head.startswith(b"CNXN"):
+        log("adb conn from", peer, "- no valid CNXN, closing (park kept)")
+        writer.close()
+        return
+    if not parked:
+        # someone else took the park while we were reading the handshake
         writer.close()
         return
     pr, pw, before, ptask = parked
     parked = None
+    park_ev.clear()
     if ptask and not ptask.done():
         ptask.cancel()
         try:
@@ -78,6 +129,8 @@ async def adb(reader, writer):
     if before:
         writer.write(bytes(before))
         await writer.drain()
+    pw.write(head)
+    await pw.drain()
 
     state = {"last": time.monotonic(), "up": False}
 
