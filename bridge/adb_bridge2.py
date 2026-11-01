@@ -33,7 +33,10 @@ TS_IP = "100.126.239.27"
 PARK_PORT = 2222
 ADB_PORT = 2223
 SPLICE_IDLE_S = 30
-SPLICE_ESTABLISHED_S = 600
+# Backstop only: both splice ends carry TCP keepalive (~105s dead-peer
+# detection), so a healthy idle adb session must NOT be killed here — a 600s
+# cap used to flap live sessions into an offline/repark cycle every 10 min.
+SPLICE_ESTABLISHED_S = 3600
 ADB_HANDSHAKE_S = 3   # adb conn must send CNXN within this or die alone
 PARK_WAIT_S = 3       # adb conn with no phone waits this long for a park
 
@@ -91,6 +94,7 @@ async def park(reader, writer):
 async def adb(reader, writer):
     global parked, _last_nopark_log
     peer = writer.get_extra_info("peername")
+    keepalive(writer)   # a silently-dead adb client must not pin the park
     if not parked:
         try:
             await asyncio.wait_for(park_ev.wait(), PARK_WAIT_S)
