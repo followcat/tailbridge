@@ -12,7 +12,9 @@ import java.net.Socket
 // network (WiFi or cellular). mDNS only helps on multicast-capable links,
 // which cellular/TUN are not -- so when NSD is blind we find the port by
 // scanning loopback, the same trick LADB uses. Two adb flavors exist:
-//   TLS   wireless-debugging listener (random high port, TLS first byte)
+//   STLS  wireless-debugging listener: speaks adb wire first, answers our
+//         CNXN probe with STLS (start-TLS) -- authoritative adbd proof
+//   TLS   TLS-first wireless-debugging listener (random high port)
 //   CNXN  legacy listener from `adb tcpip` (fixed, e.g. 5555, ADB proto)
 object AdbdProbe {
 
@@ -36,6 +38,7 @@ object AdbdProbe {
     // (cmd ^ 0xffffffff) makes the reply self-validating.
     private const val A_CNXN = 0x4e584e43L
     private const val A_AUTH = 0x48545541L
+    private const val A_STLS = 0x534c5453L
 
     private fun u32(v: Long): ByteArray = byteArrayOf(
         (v and 0xff).toByte(), ((v shr 8) and 0xff).toByte(),
@@ -71,7 +74,10 @@ object AdbdProbe {
     }
 
     // Legacy-adb check: send CNXN, expect a reply header whose magic is
-    // cmd's bitwise not and whose command is CNXN or AUTH.
+    // cmd's bitwise not and whose command is CNXN, AUTH or STLS. STLS is
+    // the TLS-mode adbd telling us to upgrade -- still proof it's adbd,
+    // and plain TCP relay to it works because the desktop client drives
+    // the STLS handshake itself.
     fun isAdb(port: Int): Boolean {
         val s = open(port, 800) ?: return false
         return try {
@@ -92,7 +98,8 @@ object AdbdProbe {
                 ((h[off + 3].toLong() and 0xff) shl 24)
             val cmd = rd(0)
             val magic = rd(20)
-            (cmd == A_CNXN || cmd == A_AUTH) && magic == (cmd xor 0xffffffffL)
+            (cmd == A_CNXN || cmd == A_AUTH || cmd == A_STLS) &&
+                magic == (cmd xor 0xffffffffL)
         } catch (_: Exception) { false } finally {
             try { s.close() } catch (_: Exception) {}
         }
